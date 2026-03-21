@@ -1,0 +1,6 @@
+{
+  "name": "minihive",
+  "description": "Multi-agent orchestrator — PM plans, agents build in parallel, test, review, commit",
+  "version": "0.1.0",
+  "commands": ["commands/minihive.md"]
+}
