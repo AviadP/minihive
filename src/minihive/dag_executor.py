@@ -13,9 +13,11 @@ spawner, dashboard events, agent log files, commit approval callbacks.
 from __future__ import annotations
 
 import asyncio
+import json as _json
 import logging
 import time
 from dataclasses import dataclass, field
+from pathlib import Path as _Path
 from typing import Any
 
 from minihive.config import (
@@ -57,6 +59,65 @@ _NO_RETRY_CATEGORIES: frozenset[FailureCategory] = frozenset({
 # Two-phase execution constants
 _SUMMARY_PHASE_TURNS = 5
 _MIN_WORK_TURNS_FOR_SUMMARY = 3
+
+
+def _print_progress(completed: dict, total: int, round_num: int, cost: float) -> None:
+    done = len(completed)
+    success = sum(1 for o in completed.values() if o.is_successful())
+    failed = done - success
+    bar_len = 30
+    filled = int(bar_len * done / total) if total else 0
+    bar = "\u2588" * filled + "\u2591" * (bar_len - filled)
+    print(f"\n  [{bar}] {done}/{total} tasks | Round {round_num} | ${cost:.2f}")
+    if failed:
+        print(f"  ({failed} failed)")
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint — save/load/clear execution state
+# ---------------------------------------------------------------------------
+
+_CHECKPOINT_FILE = ".minihive/checkpoint.json"
+
+
+def _save_checkpoint(project_dir: str, graph: TaskGraph, completed: dict[str, TaskOutput],
+                     retries: dict[str, int], total_cost: float, round_num: int,
+                     healing_history: list[dict]) -> None:
+    """Save execution state to .minihive/checkpoint.json for resume."""
+    ckpt_dir = _Path(project_dir) / ".minihive"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    data = {
+        "graph": graph.model_dump(mode="json"),
+        "completed": {tid: out.model_dump(mode="json") for tid, out in completed.items()},
+        "retries": retries,
+        "total_cost": total_cost,
+        "round_num": round_num,
+        "healing_history": healing_history,
+    }
+    ckpt_path = ckpt_dir / "checkpoint.json"
+    ckpt_path.write_text(_json.dumps(data, indent=2, default=str))
+    logger.info("Checkpoint saved: %d/%d tasks, round %d", len(completed), len(graph.tasks), round_num)
+
+
+def _load_checkpoint(project_dir: str) -> dict | None:
+    """Load checkpoint from .minihive/checkpoint.json, or None if not found."""
+    ckpt_path = _Path(project_dir) / _CHECKPOINT_FILE
+    if not ckpt_path.exists():
+        return None
+    try:
+        data = _json.loads(ckpt_path.read_text())
+        return data
+    except (OSError, _json.JSONDecodeError, ValueError) as exc:
+        logger.warning("Failed to load checkpoint: %s", exc)
+        return None
+
+
+def _clear_checkpoint(project_dir: str) -> None:
+    """Remove checkpoint file after successful completion."""
+    ckpt_path = _Path(project_dir) / _CHECKPOINT_FILE
+    if ckpt_path.exists():
+        ckpt_path.unlink()
+        logger.info("Checkpoint cleared")
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +220,7 @@ async def execute_graph(
     prompts: dict[str, str] | None = None,
     max_budget_usd: float = 50.0,
     max_concurrent: int = DAG_MAX_CONCURRENT_NODES,
+    resume: bool = False,
 ) -> ExecutionResult:
     """Execute a TaskGraph to completion with self-healing.
 
@@ -169,10 +231,31 @@ async def execute_graph(
         prompts:        role_name -> system prompt.
         max_budget_usd: Hard budget cap across the entire graph.
         max_concurrent: Max DAG nodes running simultaneously.
+        resume:         If True, attempt to restore from checkpoint.
 
     Returns:
         ExecutionResult with all outputs, cost, and healing history.
     """
+    completed: dict[str, TaskOutput] = {}
+    retries: dict[str, int] = {}
+    total_cost = 0.0
+    healing_history: list[dict] = []
+    start_round = 0
+
+    # Restore from checkpoint if requested
+    if resume:
+        ckpt = _load_checkpoint(project_dir)
+        if ckpt is not None:
+            graph = TaskGraph(**ckpt["graph"])
+            completed = {tid: TaskOutput(**v) for tid, v in ckpt["completed"].items()}
+            retries = ckpt.get("retries", {})
+            total_cost = ckpt.get("total_cost", 0.0)
+            start_round = ckpt.get("round_num", 0)
+            healing_history = ckpt.get("healing_history", [])
+            print(f"  Resuming from checkpoint: {len(completed)}/{len(graph.tasks)} tasks done, round {start_round}")
+        else:
+            print("  No checkpoint found, starting fresh")
+
     # Validate DAG structure
     errors = graph.validate_dag()
     if errors:
@@ -188,11 +271,11 @@ async def execute_graph(
         "sdk": sdk,
         "prompts": prompts,
         "max_budget_usd": max_budget_usd,
-        "completed": {},           # task_id -> TaskOutput
-        "retries": {},             # task_id -> int
-        "total_cost": 0.0,
+        "completed": completed,
+        "retries": retries,
+        "total_cost": total_cost,
         "remediation_count": 0,
-        "healing_history": [],
+        "healing_history": healing_history,
         "task_counter": len(graph.tasks),
         "graph_lock": asyncio.Lock(),
         "session_ids": {},         # session_key -> session_id
@@ -200,16 +283,19 @@ async def execute_graph(
         "artifact_registry": ArtifactRegistry(project_dir),
         "concurrency": concurrency,
         "file_lock_manager": file_lock_manager,
+        "start_round": start_round,
     }
 
-    print(
-        f"[DAG] Starting: {len(graph.tasks)} tasks, "
-        f"budget=${max_budget_usd:.2f}, concurrency={concurrency}"
-    )
+    print(f"\n{'='*60}")
+    print(f"  MINIHIVE \u2014 Executing {len(graph.tasks)} tasks")
+    print(f"  Vision: {graph.vision}")
+    print(f"{'='*60}")
+    for t in graph.tasks:
+        deps = f" (after: {', '.join(t.depends_on)})" if t.depends_on else ""
+        print(f"  [{t.id}] {t.role.value}: {t.goal[:70]}{deps}")
+    print(f"{'='*60}\n")
 
     result = await _execute_graph_inner(ctx)
-
-    print(f"\n{result.summary}")
     return result
 
 
@@ -223,7 +309,8 @@ async def _execute_graph_inner(ctx: dict[str, Any]) -> ExecutionResult:
     graph: TaskGraph = ctx["graph"]
     completed: dict[str, TaskOutput] = ctx["completed"]
     max_budget: float = ctx["max_budget_usd"]
-    round_num = 0
+    project_dir: str = ctx["project_dir"]
+    round_num = ctx.get("start_round", 0)
 
     while not graph.is_complete(completed):
         round_num += 1
@@ -251,10 +338,7 @@ async def _execute_graph_inner(ctx: dict[str, Any]) -> ExecutionResult:
 
         # Plan and execute batches
         batches = _plan_batches(ready)
-        print(
-            f"\nRound {round_num}: {len(completed)}/{len(graph.tasks)} tasks done "
-            f"(${ctx['total_cost']:.2f})"
-        )
+        print(f"\n--- Round {round_num} ---")
 
         for batch in batches:
             subtasks = [
@@ -291,8 +375,10 @@ async def _execute_graph_inner(ctx: dict[str, Any]) -> ExecutionResult:
                 completed[task.id] = output
                 ctx["total_cost"] += output.cost_usd
 
-                status_str = "OK" if output.is_successful() else "FAILED"
-                print(f"  [{task.id}] {status_str} (${output.cost_usd:.2f})")
+                if output.is_successful():
+                    print(f"  \u2713 [{task.id}] completed (${output.cost_usd:.2f})")
+                else:
+                    print(f"  \u2717 [{task.id}] FAILED: {output.summary[:80]}")
 
                 # Successful remediation unblocks downstream
                 if output.is_successful() and task.is_remediation and task.original_task_id:
@@ -316,6 +402,27 @@ async def _execute_graph_inner(ctx: dict[str, Any]) -> ExecutionResult:
                 # Handle failures
                 if not output.is_successful():
                     await _handle_failure(task, output, ctx)
+
+        _print_progress(ctx["completed"], len(graph.tasks), round_num, ctx["total_cost"])
+
+        # Save checkpoint after each round
+        _save_checkpoint(
+            project_dir, graph, completed, ctx["retries"],
+            ctx["total_cost"], round_num, ctx["healing_history"],
+        )
+
+    # Clear checkpoint on successful completion
+    if graph.is_complete(completed):
+        _clear_checkpoint(project_dir)
+
+    healing_history = ctx["healing_history"]
+    print(f"\n{'='*60}")
+    print(f"  EXECUTION COMPLETE")
+    print(f"  Tasks: {len(ctx['completed'])}/{len(graph.tasks)}")
+    print(f"  Cost: ${ctx['total_cost']:.2f}")
+    if healing_history:
+        print(f"  Self-healed: {len(healing_history)} tasks")
+    print(f"{'='*60}")
 
     return ExecutionResult(
         completed_tasks=completed,
@@ -374,7 +481,7 @@ async def _run_single_task(task: TaskInput, ctx: dict[str, Any]) -> TaskOutput:
     retry_count = ctx["retries"].get(task.id, 0)
     task_timeout = get_agent_timeout(role_name, retry_attempt=retry_count)
 
-    print(f"  [{task.id}] {role_name} starting: {task.goal[:80]}...")
+    print(f"  \u25b6 [{task.id}] {role_name}: {task.goal[:60]}...")
 
     # Gather upstream context
     context_outputs = {
@@ -734,7 +841,7 @@ async def _create_remediation(
         ),
     })
 
-    print(f"  Self-healing: creating fix task for {failed_task.id}")
+    print(f"  \u21bb Self-healing: {remediation.id} to fix {failed_task.id}")
     return True
 
 
