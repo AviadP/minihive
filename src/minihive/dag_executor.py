@@ -18,6 +18,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path as _Path
+from collections.abc import Callable
 from typing import Any
 
 from minihive.config import (
@@ -222,6 +223,8 @@ async def execute_graph(
     max_budget_usd: float = 50.0,
     max_concurrent: int = DAG_MAX_CONCURRENT_NODES,
     resume: bool = False,
+    on_task_done: Callable | None = None,
+    on_round_done: Callable | None = None,
 ) -> ExecutionResult:
     """Execute a TaskGraph to completion with self-healing.
 
@@ -233,6 +236,8 @@ async def execute_graph(
         max_budget_usd: Hard budget cap across the entire graph.
         max_concurrent: Max DAG nodes running simultaneously.
         resume:         If True, attempt to restore from checkpoint.
+        on_task_done:   Optional async callback(task, output) called after each task.
+        on_round_done:  Optional async callback(round_num, completed, total_cost) called after each round.
 
     Returns:
         ExecutionResult with all outputs, cost, and healing history.
@@ -285,6 +290,8 @@ async def execute_graph(
         "concurrency": concurrency,
         "file_lock_manager": file_lock_manager,
         "start_round": start_round,
+        "on_task_done": on_task_done,
+        "on_round_done": on_round_done,
     }
 
     print(f"\n{'='*60}")
@@ -381,6 +388,12 @@ async def _execute_graph_inner(ctx: dict[str, Any]) -> ExecutionResult:
                 else:
                     print(f"  \u2717 [{task.id}] FAILED: {output.summary[:80]}")
 
+                if ctx.get("on_task_done"):
+                    try:
+                        await ctx["on_task_done"](task, output)
+                    except (OSError, RuntimeError, ValueError):
+                        logger.warning("on_task_done callback failed for %s", task.id)
+
                 # Successful remediation unblocks downstream
                 if output.is_successful() and task.is_remediation and task.original_task_id:
                     completed[task.original_task_id] = output
@@ -405,6 +418,12 @@ async def _execute_graph_inner(ctx: dict[str, Any]) -> ExecutionResult:
                     await _handle_failure(task, output, ctx)
 
         _print_progress(ctx["completed"], len(graph.tasks), round_num, ctx["total_cost"])
+
+        if ctx.get("on_round_done"):
+            try:
+                await ctx["on_round_done"](round_num, completed, ctx["total_cost"])
+            except (OSError, RuntimeError, ValueError):
+                logger.warning("on_round_done callback failed for round %d", round_num)
 
         # Save checkpoint after each round
         _save_checkpoint(
