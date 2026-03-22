@@ -7,11 +7,30 @@ import shutil
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from minihive.contracts import TaskGraph
     from minihive.dag_executor import ExecutionResult
+
+
+class _TeeWriter:
+    """Write to both the original stream and a log file."""
+
+    def __init__(self, original: object, log_file: object) -> None:
+        self.original = original
+        self.log_file = log_file
+
+    def write(self, text: str) -> int:
+        self.original.write(text)
+        self.log_file.write(text)
+        self.log_file.flush()
+        return len(text)
+
+    def flush(self) -> None:
+        self.original.flush()
+        self.log_file.flush()
 
 
 def _check_claude_cli() -> str:
@@ -68,6 +87,28 @@ async def _run(args: argparse.Namespace) -> None:
     project_dir = os.path.abspath(args.project_dir)
     _check_git_repo(project_dir)
 
+    # Tee stdout to .minihive/run.log so background runs are reviewable
+    log_dir = Path(project_dir) / ".minihive"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "run.log"
+    log_file = open(log_path, "a")  # noqa: SIM115
+    log_file.write(f"\n{'='*60}\n")
+    log_file.write(f"  minihive run — {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    log_file.write(f"  project: {project_dir}\n")
+    log_file.write(f"  args: {' '.join(sys.argv[1:])}\n")
+    log_file.write(f"{'='*60}\n")
+    log_file.flush()
+    original_stdout = sys.stdout
+    sys.stdout = _TeeWriter(original_stdout, log_file)
+    try:
+        await _run_inner(args, cli_path, project_dir)
+    finally:
+        sys.stdout = original_stdout
+        log_file.close()
+        print(f"Log saved to: {log_path}")
+
+
+async def _run_inner(args: argparse.Namespace, cli_path: str, project_dir: str) -> None:
     from minihive.config import MAX_BUDGET_USD
     from minihive.sdk_client import ClaudeSDKManager
 
