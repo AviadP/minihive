@@ -50,9 +50,9 @@ git clone <this-repo> ~/minihive
 cd ~/minihive
 uv venv && uv pip install -e .
 
-# Install as Claude Code plugin (available globally)
-mkdir -p ~/.claude/plugins
-ln -s ~/minihive ~/.claude/plugins/minihive
+# Install as Claude Code slash command (available globally)
+mkdir -p ~/.claude/commands
+cp ~/minihive/commands/minihive.md ~/.claude/commands/minihive.md
 ```
 
 ## Usage
@@ -77,15 +77,23 @@ minihive --plan-file .claude/plans/my-plan.md
 
 # Combine: convert plan to TaskGraph and preview it
 minihive --plan-file plan.md --dry-run
+
+# Resume after interruption (picks up from .minihive/checkpoint.json)
+minihive --resume --project-dir ~/myapp
 ```
 
-### Claude Code Plugin
+### Claude Code Slash Command
 
-After installing the symlink, use `/minihive` in any Claude Code session:
+After installing the command file, use `/minihive` in any Claude Code session:
 
 ```
 /minihive Add JWT authentication with a login page
+/minihive --plan-file .claude/plans/my-plan.md
 ```
+
+### Logs and Checkpoints
+
+All output is saved to `.minihive/run.log` in the project directory — readable after background runs. Execution state is checkpointed to `.minihive/checkpoint.json` after each round, so interrupted runs can be resumed with `--resume`.
 
 ## What It Does
 
