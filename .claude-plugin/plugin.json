@@ -2,5 +2,9 @@
   "name": "minihive",
   "description": "Multi-agent orchestrator — PM plans, agents build in parallel, test, review, commit",
   "version": "0.1.3",
-  "commands": ["commands/minihive.md"]
+  "author": {
+    "name": "Aviad Polak"
+  },
+  "repository": "https://github.com/AviadP/minihive",
+  "license": "Apache-2.0"
 }
