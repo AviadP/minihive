@@ -44,6 +44,7 @@ from minihive.contracts import (
     task_input_to_prompt,
 )
 from minihive.file_context import ArtifactRegistry
+from minihive.project_context import build_project_header
 from minihive.git_ops import commit_single_task
 from minihive.sdk_client import ClaudeSDKManager
 
@@ -498,6 +499,16 @@ async def _run_single_task(task: TaskInput, ctx: dict[str, Any]) -> TaskOutput:
         graph_vision=graph.vision,
         graph_epics=graph.epic_breakdown,
     )
+
+    # Inject project CLAUDE.md rules at the top of the prompt
+    project_context = build_project_header(ctx["project_dir"])
+    if project_context:
+        prompt = (
+            "<project_rules>\n"
+            "MANDATORY — The project owner defined these rules. You MUST follow them:\n"
+            f"{project_context}\n"
+            "</project_rules>\n\n"
+        ) + prompt
 
     # Get system prompt
     prompts = ctx["prompts"]
